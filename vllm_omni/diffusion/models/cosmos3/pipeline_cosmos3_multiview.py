@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -62,6 +63,9 @@ logger = init_logger(__name__)
 # Overrides transformer config multiview.backend, so the Triton and FA4 sparse
 # attention paths can be compared without editing the checkpoint.
 COSMOS3_MULTIVIEW_BACKEND_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_BACKEND"
+
+# Number of workers used for thread-parallel per-camera video decoding.
+COSMOS3_MULTIVIEW_MEDIA_WORKERS_ENV = "VLLM_OMNI_COSMOS3_MULTIVIEW_MEDIA_WORKERS"
 
 # Per-camera frame count when the request supplies none.
 COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES = 201
@@ -458,8 +462,7 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
         num_frames: int,
         keep_first: bool,
     ) -> torch.Tensor:
-        prepared = []
-        for view in views:
+        def _prepare_one(view: Mapping[str, Any]) -> torch.Tensor:
             value = self._view_value(view, field)
             if value is None:
                 raise ValueError(f"Cosmos3 multiview camera {view['camera_key']!r} is missing {field} input.")
@@ -469,7 +472,15 @@ class Cosmos3MultiviewPipeline(Cosmos3OmniDiffusersPipeline):
                 width=width,
                 max_frames=1 if keep_first else num_frames,
             )
-            prepared.append(_pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width))
+            return _pad_multiview_view_video(frames, num_frames=num_frames, height=height, width=width)
+
+        workers = int(os.environ.get(COSMOS3_MULTIVIEW_MEDIA_WORKERS_ENV) or len(os.sched_getaffinity(0)))
+        workers = min(max(workers, 1), len(views))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                prepared = list(pool.map(_prepare_one, views))
+        else:
+            prepared = [_prepare_one(view) for view in views]
         camera_major = torch.cat(prepared, dim=1)
         return uint8_cthw_to_normalized_5d(camera_major, dtype=self.dtype)
 
